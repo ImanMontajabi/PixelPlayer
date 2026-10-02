@@ -80,6 +80,39 @@ class DuplicateSongMatcherTest {
     }
 
     @Test
+    fun artistThatIsOnlyASubstringOfAnother_isNotDuplicate() {
+        val matcher = DuplicateSongMatcher()
+        matcher.add("No One Knows", "Queens of the Stone Age", 255_000)
+
+        assertFalse(matcher.isDuplicate("No One Knows", "Queen", 255_000))
+    }
+
+    @Test
+    fun artistNameInsideTitleOutsideBrackets_isNotCompatible() {
+        val matcher = DuplicateSongMatcher()
+        matcher.add("Love Me Do", "The Beatles", 140_000)
+
+        assertFalse(matcher.isDuplicate("Love Me Do", "Do", 140_000))
+    }
+
+    @Test
+    fun sharedCreditInFeaturingList_isDuplicate() {
+        val matcher = DuplicateSongMatcher()
+        matcher.add("Track", "Main Artist feat. Guest", 200_000)
+
+        assertTrue(matcher.isDuplicate("Track", "Main Artist", 200_000))
+        assertTrue(matcher.isDuplicate("Track", "Guest & Someone Else", 200_000))
+    }
+
+    @Test
+    fun separateCreditLists_withoutSharedCredit_areNotDuplicates() {
+        val matcher = DuplicateSongMatcher()
+        matcher.add("Track", "Alpha x Beta", 200_000)
+
+        assertFalse(matcher.isDuplicate("Track", "Gamma, Delta", 200_000))
+    }
+
+    @Test
     fun blankTitle_neverMatches() {
         val matcher = DuplicateSongMatcher()
         matcher.add("", "Artist", 100_000)
