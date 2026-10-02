@@ -23,6 +23,7 @@ import com.theveloper.pixelplay.data.navidrome.model.NavidromeSong
 import com.theveloper.pixelplay.data.network.navidrome.NavidromeApiService
 import com.theveloper.pixelplay.data.network.navidrome.NavidromeResponseParser
 import com.theveloper.pixelplay.data.preferences.PlaylistPreferencesRepository
+import com.theveloper.pixelplay.data.preferences.UserPreferencesRepository
 import com.theveloper.pixelplay.data.stream.BulkSyncResult
 import com.theveloper.pixelplay.data.stream.CloudMusicUtils
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -59,6 +60,7 @@ class NavidromeRepository @Inject constructor(
     private val dao: NavidromeDao,
     private val musicDao: MusicDao,
     private val playlistPreferencesRepository: PlaylistPreferencesRepository,
+    private val userPreferencesRepository: UserPreferencesRepository,
     @ApplicationContext private val context: Context
 ) {
     companion object {
@@ -699,14 +701,28 @@ class NavidromeRepository @Inject constructor(
      * Sync Navidrome songs to the unified music library.
      */
     suspend fun syncUnifiedLibrarySongsFromNavidrome() {
-        val navidromeSongs = dao.getAllNavidromeSongsList()
+        val allNavidromeSongs = dao.getAllNavidromeSongsList()
         val existingUnifiedIds = musicDao.getAllNavidromeSongIds()
 
-        if (navidromeSongs.isEmpty()) {
+        if (allNavidromeSongs.isEmpty()) {
             if (existingUnifiedIds.isNotEmpty()) {
                 musicDao.clearAllNavidromeSongs()
             }
             return
+        }
+
+        // Navidrome yields to songs already on the device or synced from Telegram/Netease.
+        val navidromeSongs = if (userPreferencesRepository.skipDuplicateSongsFlow.first()) {
+            val matcher = musicDao.buildDuplicateMatcher(
+                listOf(SourceType.LOCAL, SourceType.TELEGRAM, SourceType.NETEASE)
+            )
+            allNavidromeSongs.sortedBy { it.navidromeId }.filter { song ->
+                val duplicate = matcher.isDuplicate(song.title, song.artist, song.duration)
+                if (!duplicate) matcher.add(song.title, song.artist, song.duration)
+                !duplicate
+            }
+        } else {
+            allNavidromeSongs
         }
 
         val songs = ArrayList<SongEntity>(navidromeSongs.size)
