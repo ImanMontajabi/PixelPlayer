@@ -9,7 +9,6 @@ import androidx.room.Transaction
 import androidx.room.Update
 import androidx.sqlite.db.SimpleSQLiteQuery
 import com.theveloper.pixelplay.utils.AudioMeta
-import com.theveloper.pixelplay.utils.DuplicateSongMatcher
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 
@@ -120,6 +119,7 @@ data class MimeTypeCountRow(
 
 /** Minimal song fingerprint used to detect the same track coming from different sources. */
 data class SongDuplicateKeyRow(
+    val id: Long,
     val title: String,
     val artistName: String,
     val duration: Long
@@ -246,20 +246,15 @@ interface MusicDao {
     @Query("DELETE FROM lyrics WHERE songId IN (:songIds)")
     suspend fun deleteLyricsBySongIds(songIds: List<Long>)
 
-    @Query("SELECT title AS title, artist_name AS artistName, duration AS duration FROM songs WHERE source_type IN (:sourceTypes)")
+    @Query("SELECT id AS id, title AS title, artist_name AS artistName, duration AS duration FROM songs WHERE source_type IN (:sourceTypes)")
     suspend fun getSongDuplicateKeysBySourceTypes(sourceTypes: List<Int>): List<SongDuplicateKeyRow>
 
-    /**
-     * Builds a [DuplicateSongMatcher] seeded with the songs of every source that takes
-     * priority over the one being synced (local > Telegram > Netease > Navidrome).
-     */
-    suspend fun buildDuplicateMatcher(prioritySourceTypes: List<Int>): DuplicateSongMatcher {
-        val matcher = DuplicateSongMatcher()
-        getSongDuplicateKeysBySourceTypes(prioritySourceTypes).forEach {
-            matcher.add(it.title, it.artistName, it.duration)
-        }
-        return matcher
-    }
+    @Query("""
+        INSERT OR IGNORE INTO favorites (songId, isFavorite, timestamp)
+        SELECT :toSongId, isFavorite, timestamp FROM favorites
+        WHERE songId = :fromSongId AND isFavorite = 1
+    """)
+    suspend fun copyFavorite(fromSongId: Long, toSongId: Long)
 
     @Query("SELECT id FROM songs WHERE source_type = 1")
     suspend fun getAllTelegramSongIds(): List<Long>

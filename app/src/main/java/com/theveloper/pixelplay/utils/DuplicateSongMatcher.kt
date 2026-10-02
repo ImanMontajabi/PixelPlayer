@@ -8,55 +8,59 @@ import kotlin.math.abs
  * (e.g. a file downloaded from a Telegram channel into local storage and the very same
  * audio message streamed from that channel).
  *
- * Two songs are considered duplicates when their normalized titles are identical, their
- * durations are within [DURATION_TOLERANCE_MS] and their artists are compatible.
+ * Two songs are duplicates when their normalized titles are identical, nothing contradicts
+ * the match and at least one more signal confirms it:
+ * - contradictions: both durations are known but differ by more than [DURATION_TOLERANCE_MS],
+ *   or both artists are known but share no credit;
+ * - confirmations: both durations are known and close, or the artists share a credit.
  *
- * Artists are compared credit by credit ("A feat. B" -> {A, B}); two artist fields are
- * compatible when they share at least one whole credit. Substrings never count, so "Queen"
- * does not match "Queens of the Stone Age".
+ * Artists are compared credit by credit ("A feat. B" -> {A, B}). Substrings never count, so
+ * "Queen" does not match "Queens of the Stone Age".
  *
  * Songs without tags usually get their file name as title (e.g. "Track.mp3"). Their artist
- * is meaningless, so the audio extension is ignored for the title comparison and the
- * artist check is skipped for them.
+ * is meaningless, so the audio extension is ignored for the title comparison and their
+ * artist is treated as unknown.
  */
 class DuplicateSongMatcher {
 
     private class Entry(
+        val songId: Long,
         val credits: Set<String>,
         val bracketSegments: Set<String>,
-        val artistReliable: Boolean,
         val durationMs: Long
     )
 
     private val entriesByTitle = HashMap<String, MutableList<Entry>>()
 
-    fun add(title: String, artist: String, durationMs: Long) {
-        val entry = buildEntry(title, artist, durationMs) ?: return
-        entriesByTitle.getOrPut(titleKey(title)) { mutableListOf() }.add(entry)
+    fun add(songId: Long, title: String, artist: String, durationMs: Long) {
+        val key = titleKey(title)
+        if (key.isEmpty()) return
+        entriesByTitle.getOrPut(key) { mutableListOf() }
+            .add(buildEntry(songId, title, artist, durationMs))
     }
 
-    fun isDuplicate(title: String, artist: String, durationMs: Long): Boolean {
-        val candidates = entriesByTitle[titleKey(title)] ?: return false
-        val probe = buildEntry(title, artist, durationMs) ?: return false
-        return candidates.any { candidate ->
-            durationsMatch(candidate.durationMs, probe.durationMs) &&
-                (!candidate.artistReliable || !probe.artistReliable ||
-                    artistsCompatible(candidate, probe))
-        }
+    /** Returns the id of a previously added song that is the same track, or null. */
+    fun findDuplicate(title: String, artist: String, durationMs: Long): Long? {
+        val key = titleKey(title)
+        if (key.isEmpty()) return null
+        val candidates = entriesByTitle[key] ?: return null
+        val probe = buildEntry(NO_ID, title, artist, durationMs)
+        return candidates.firstOrNull { isSameTrack(it, probe) }?.songId
     }
 
-    private fun buildEntry(title: String, artist: String, durationMs: Long): Entry? {
-        if (titleKey(title).isEmpty()) return null
-        return Entry(
-            credits = splitCredits(artist),
-            bracketSegments = bracketSegments(title),
-            artistReliable = !hasAudioExtension(title),
-            durationMs = durationMs
-        )
-    }
+    fun isDuplicate(title: String, artist: String, durationMs: Long): Boolean =
+        findDuplicate(title, artist, durationMs) != null
+
+    private fun buildEntry(songId: Long, title: String, artist: String, durationMs: Long) = Entry(
+        songId = songId,
+        credits = if (hasAudioExtension(title)) emptySet() else splitCredits(artist),
+        bracketSegments = bracketSegments(title),
+        durationMs = durationMs
+    )
 
     companion object {
         const val DURATION_TOLERANCE_MS = 2_000L
+        private const val NO_ID = Long.MIN_VALUE
 
         private val UNKNOWN_ARTIST_MARKERS = setOf("unknown", "unknownartist", "نامشخص", "ناشناس")
 
@@ -82,38 +86,45 @@ class DuplicateSongMatcher {
         private fun titleKey(title: String): String =
             normalizeForMatching(title.replace(AUDIO_EXTENSION_REGEX, ""))
 
-        internal fun durationsMatch(a: Long, b: Long): Boolean {
-            // A missing duration (0) can't be used to prove two songs differ.
-            if (a <= 0L || b <= 0L) return true
-            return abs(a - b) <= DURATION_TOLERANCE_MS
+        private fun isSameTrack(a: Entry, b: Entry): Boolean {
+            val durationsKnown = a.durationMs > 0L && b.durationMs > 0L
+            if (durationsKnown && abs(a.durationMs - b.durationMs) > DURATION_TOLERANCE_MS) {
+                return false
+            }
+            val artistsKnown = !isUnknown(a.credits) && !isUnknown(b.credits)
+            if (artistsKnown) return artistsCompatible(a, b)
+            // Without usable artists the title alone is too weak; require matching durations.
+            return durationsKnown
         }
 
-        private fun splitCredits(artist: String): Set<String> =
-            artist.split(CREDIT_SEPARATOR_REGEX)
+        private fun splitCredits(artist: String): Set<String> {
+            if (artist.isBlank()) return emptySet()
+            return artist.split(CREDIT_SEPARATOR_REGEX)
                 .map { normalizeForMatching(it) }
-                .filter { it.isNotEmpty() }
-                .toSet()
+                .filterTo(HashSet()) { it.isNotEmpty() }
+        }
 
         private fun bracketSegments(title: String): Set<String> {
-            val segments = LinkedHashSet<String>()
-            BRACKET_SEGMENT_REGEX.findAll(title.replace(AUDIO_EXTENSION_REGEX, "")).forEach { match ->
+            val matches = BRACKET_SEGMENT_REGEX.findAll(title.replace(AUDIO_EXTENSION_REGEX, ""))
+            var segments: MutableSet<String>? = null
+            matches.forEach { match ->
                 val segment = normalizeForMatching(match.groupValues[1])
                 if (segment.isEmpty()) return@forEach
-                segments.add(segment)
+                val target = segments ?: HashSet<String>().also { segments = it }
+                target.add(segment)
                 SEGMENT_SUFFIXES.forEach { suffix ->
                     if (segment.endsWith(suffix) && segment.length > suffix.length) {
-                        segments.add(segment.removeSuffix(suffix))
+                        target.add(segment.removeSuffix(suffix))
                     }
                 }
             }
-            return segments
+            return segments ?: emptySet()
         }
 
         private fun isUnknown(credits: Set<String>): Boolean =
             credits.isEmpty() || credits.all { it in UNKNOWN_ARTIST_MARKERS }
 
         private fun artistsCompatible(a: Entry, b: Entry): Boolean {
-            if (isUnknown(a.credits) || isUnknown(b.credits)) return true
             if (a.credits.any { it in b.credits }) return true
             // The artist tag of one song may only appear as a credit in the other's title,
             // e.g. title "Alaki (BLH Remix)" with artist tag "BLH Remix".
@@ -122,22 +133,26 @@ class DuplicateSongMatcher {
         }
 
         /**
-         * Lowercases, strips diacritics/punctuation/whitespace and unifies Arabic/Persian letter
-         * variants so tag differences such as "Song - Name" vs "song name" still match.
+         * Lowercases, strips diacritics/punctuation/whitespace, maps any decimal digit to ASCII
+         * and unifies Arabic/Persian letter variants, so tag differences such as
+         * "Song - Name" vs "song name" or "۲" vs "2" still match.
          */
         internal fun normalizeForMatching(value: String): String {
             if (value.isBlank()) return ""
             val decomposed = Normalizer.normalize(value, Normalizer.Form.NFKD)
             val sb = StringBuilder(decomposed.length)
             for (ch in decomposed) {
-                val mapped = when (ch) {
-                    'ي', 'ى' -> 'ی'
-                    'ك' -> 'ک'
-                    'ة' -> 'ه'
-                    else -> ch
-                }
-                if (Character.isLetterOrDigit(mapped)) {
-                    sb.append(mapped.lowercaseChar())
+                when {
+                    ch == '\u0640' -> Unit // Arabic tatweel (kashida)
+                    Character.isDigit(ch) -> sb.append(Character.digit(ch, 10))
+                    Character.isLetter(ch) -> sb.append(
+                        when (ch) {
+                            'ي', 'ى' -> 'ی'
+                            'ك' -> 'ک'
+                            'ة', 'ە', 'ہ' -> 'ه'
+                            else -> ch.lowercaseChar()
+                        }
+                    )
                 }
             }
             return sb.toString()

@@ -34,13 +34,13 @@ import com.theveloper.pixelplay.data.navidrome.NavidromeRepository
 import com.theveloper.pixelplay.data.media.AudioMetadataReader
 import com.theveloper.pixelplay.data.model.Song
 import com.theveloper.pixelplay.data.preferences.UserPreferencesRepository
+import com.theveloper.pixelplay.data.repository.CloudDuplicateFilter
 import com.theveloper.pixelplay.data.repository.LyricsRepository
 import com.theveloper.pixelplay.data.service.PlaybackActivityTracker
 import com.theveloper.pixelplay.utils.AlbumArtCacheManager
 import com.theveloper.pixelplay.utils.AlbumArtUtils
 import com.theveloper.pixelplay.utils.AudioMetaUtils.getAudioMetadata
 import com.theveloper.pixelplay.utils.DirectoryRuleResolver
-import com.theveloper.pixelplay.utils.DuplicateSongMatcher
 import com.theveloper.pixelplay.utils.buildLocalAudioSelection
 import com.theveloper.pixelplay.utils.normalizeMetadataTextOrEmpty
 import com.theveloper.pixelplay.utils.splitArtistsByDelimiters
@@ -79,7 +79,8 @@ constructor(
         private val lyricsRepository: LyricsRepository,
         private val telegramDao: TelegramDao,
         private val neteaseDao: NeteaseDao,
-        private val navidromeRepository: NavidromeRepository
+        private val navidromeRepository: NavidromeRepository,
+        private val cloudDuplicateFilter: CloudDuplicateFilter
 ) : CoroutineWorker(appContext, workerParams) {
 
     private val contentResolver: ContentResolver = appContext.contentResolver
@@ -1332,23 +1333,17 @@ constructor(
     private suspend fun syncTelegramData() {
         Log.i(TAG, "Syncing Telegram songs to main database (Unified Mode)...")
         try {
-            val skipDuplicates = userPreferencesRepository.skipDuplicateSongsFlow.first()
+            val duplicateSession = cloudDuplicateFilter.startSession(SourceType.TELEGRAM)
             val allTelegramSongs = telegramDao.getAllTelegramSongs().first()
             // A fixed order keeps "which copy wins" stable between syncs, so the unified IDs
             // referenced by playlists don't flip-flop when the same track is posted twice.
-            val telegramSongs = if (skipDuplicates) {
+            val telegramSongs = if (duplicateSession != null) {
                 allTelegramSongs.sortedWith(
                     compareByDescending<TelegramSongEntity> { it.dateAdded }.thenBy { it.id }
                 )
             } else {
                 allTelegramSongs
             }
-            val duplicateMatcher = if (skipDuplicates) {
-                musicDao.buildDuplicateMatcher(listOf(SourceType.LOCAL))
-            } else {
-                DuplicateSongMatcher()
-            }
-            var skippedDuplicates = 0
             val channels = telegramDao.getAllChannels().first().associateBy { it.chatId }
             val existingUnifiedTelegramIds = musicDao.getAllTelegramSongIds()
 
@@ -1433,12 +1428,8 @@ constructor(
 
                     // 2b. Duplicate filtering. A skipped song is never added to
                     //     syncedTelegramSongIds, so any previously synced copy is removed below.
-                    if (skipDuplicates) {
-                        if (duplicateMatcher.isDuplicate(realTitle, realArtistName, realDuration)) {
-                            skippedDuplicates++
-                            return@forEach
-                        }
-                        duplicateMatcher.add(realTitle, realArtistName, realDuration)
+                    if (duplicateSession?.keep(finalSongId, realTitle, realArtistName, realDuration) == false) {
+                        return@forEach
                     }
                     syncedTelegramSongIds.add(finalSongId)
 
@@ -1560,6 +1551,8 @@ constructor(
                 // chunk-local collections go out of scope here and are GC-eligible
             }
 
+            duplicateSession?.let { cloudDuplicateFilter.transferUserData(it) }
+
             // Delete songs that are no longer present in the Telegram DB.
             val deletedUnifiedSongIds = existingUnifiedTelegramIds.filterNot { it in syncedTelegramSongIds }
             if (deletedUnifiedSongIds.isNotEmpty()) {
@@ -1575,7 +1568,7 @@ constructor(
                 Log.i(TAG, "Telegram sync: removed ${deletedUnifiedSongIds.size} deleted songs.")
             }
 
-            Log.i(TAG, "Synced $totalSynced Telegram songs with Unified Metadata ($skippedDuplicates duplicates skipped).")
+            Log.i(TAG, "Synced $totalSynced Telegram songs with Unified Metadata (${duplicateSession?.hiddenCount ?: 0} duplicates skipped).")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to sync Telegram data", e)
         }
@@ -1595,17 +1588,12 @@ constructor(
                 return
             }
 
-            // Netease yields to songs already on the device or synced from Telegram.
-            val neteaseSongs = if (userPreferencesRepository.skipDuplicateSongsFlow.first()) {
-                val matcher = musicDao.buildDuplicateMatcher(
-                    listOf(SourceType.LOCAL, SourceType.TELEGRAM)
-                )
+            val duplicateSession = cloudDuplicateFilter.startSession(SourceType.NETEASE)
+            val neteaseSongs = if (duplicateSession != null) {
                 allNeteaseSongs.sortedBy { it.neteaseId }.filter { song ->
-                    val duplicate = matcher.isDuplicate(song.title, song.artist, song.duration)
-                    if (!duplicate) matcher.add(song.title, song.artist, song.duration)
-                    !duplicate
-                }.also {
-                    Log.i(TAG, "Netease sync: ${allNeteaseSongs.size - it.size} duplicates skipped.")
+                    duplicateSession.keep(
+                        toUnifiedNeteaseSongId(song.neteaseId), song.title, song.artist, song.duration
+                    )
                 }
             } else {
                 allNeteaseSongs
@@ -1706,6 +1694,7 @@ constructor(
             val currentUnifiedSongIds = songsToInsert.map { it.id }.toSet()
             val deletedUnifiedSongIds = existingUnifiedNeteaseIds.filter { it !in currentUnifiedSongIds }
 
+            duplicateSession?.let { cloudDuplicateFilter.transferUserData(it) }
             musicDao.incrementalSyncMusicData(
                 songs = songsToInsert,
                 albums = finalAlbums,
@@ -1713,7 +1702,7 @@ constructor(
                 crossRefs = crossRefsToInsert,
                 deletedSongIds = deletedUnifiedSongIds
             )
-            Log.i(TAG, "Synced ${songsToInsert.size} Netease songs with Unified Metadata.")
+            Log.i(TAG, "Synced ${songsToInsert.size} Netease songs with Unified Metadata (${duplicateSession?.hiddenCount ?: 0} duplicates skipped).")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to sync Netease data", e)
         }
